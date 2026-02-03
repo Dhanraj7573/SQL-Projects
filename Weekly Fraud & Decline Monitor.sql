@@ -42,5 +42,61 @@ GO
 SET DATEFIRST 1;  -- Monday
 SELECT * FROM dbo.v_weekly_kpi_channel ORDER BY week_start, channel;
 
+---trend view
+
+IF OBJECT_ID('dbo.v_weekly_kpi_channel_trend', 'V') IS NOT NULL
+    DROP VIEW dbo.v_weekly_kpi_channel_trend;
+GO
+
+CREATE VIEW dbo.v_weekly_kpi_channel_trend AS
+WITH x AS (
+    SELECT *
+    FROM dbo.v_weekly_kpi_channel
+)
+SELECT
+    week_start,
+    channel,
+
+    attempted_txns,
+    attempted_usd,
+    declined_rate_pct,
+    fraud_rate_pct,
+
+    LAG(attempted_txns) OVER (PARTITION BY channel ORDER BY week_start) AS prev_attempted_txns,
+    LAG(attempted_usd)  OVER (PARTITION BY channel ORDER BY week_start) AS prev_attempted_usd,
+    LAG(declined_rate_pct) OVER (PARTITION BY channel ORDER BY week_start) AS prev_declined_rate_pct,
+    LAG(fraud_rate_pct)    OVER (PARTITION BY channel ORDER BY week_start) AS prev_fraud_rate_pct
+FROM x;
+GO
+
+if object_id('dbo.v_weekly_kpi_channel_trend','V') is not null
+    drop view dbo.v_weekly_kpi_channel_trend;
+go
+
+SELECT * 
+FROM dbo.v_weekly_kpi_channel_trend
+ORDER BY week_start, channel;
+
+--Turn trends into alerts 
+
+SELECT
+    week_start,
+    channel,
+    attempted_txns,
+    declined_rate_pct,
+    fraud_rate_pct,
+
+    CASE
+        WHEN attempted_txns < 50 THEN 'LOW_VOLUME'
+        WHEN prev_fraud_rate_pct IS NOT NULL
+             AND fraud_rate_pct - prev_fraud_rate_pct >= 0.50
+             THEN 'FRAUD_SPIKE'
+        WHEN prev_declined_rate_pct IS NOT NULL
+             AND declined_rate_pct - prev_declined_rate_pct >= 2.00
+             THEN 'DECLINE_SPIKE'
+        ELSE 'OK'
+    END AS alert_flag
+FROM dbo.v_weekly_kpi_channel_trend
+ORDER BY week_start DESC, alert_flag DESC, channel;
 
 

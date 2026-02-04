@@ -1,0 +1,144 @@
+IF OBJECT_ID('dbo.kpi_sla_rules', 'U') IS NULL
+BEGIN
+  CREATE TABLE dbo.kpi_sla_rules (
+    kpi_name        varchar(50)  NOT NULL,
+    scope           varchar(20)  NOT NULL,  -- 'GLOBAL' or 'CHANNEL'
+    channel         varchar(50)  NULL,      -- used when scope='CHANNEL'
+    owner_team      varchar(50)  NOT NULL,
+    target_value    decimal(10,2) NOT NULL, -- percent targets here
+    comparator      varchar(5)   NOT NULL,  -- '<=' or '>='
+    severity        varchar(10)  NOT NULL,  -- LOW/MED/HIGH
+    is_active       bit          NOT NULL DEFAULT 1
+  );
+END;
+
+-- Clear existing example rules (optional)
+DELETE FROM dbo.kpi_sla_rules;
+
+-- Fraud rate SLA (in %)
+INSERT INTO dbo.kpi_sla_rules (kpi_name, scope, channel, owner_team, target_value, comparator, severity)
+VALUES
+('fraud_rate_pct',   'GLOBAL',  NULL, 'Risk',    1.20, '<=', 'HIGH'),
+('declined_rate_pct','GLOBAL',  NULL, 'Payments',8.00, '<=', 'MED');
+
+-- Optional: stricter SLA for ONLINE channel
+INSERT INTO dbo.kpi_sla_rules (kpi_name, scope, channel, owner_team, target_value, comparator, severity)
+VALUES
+('fraud_rate_pct', 'CHANNEL', 'ONLINE', 'Risk', 0.90, '<=', 'HIGH');
+
+WITH kpi_long AS (
+  SELECT
+    week_start,
+    channel,
+    CAST(attempted_txns AS decimal(18,2)) AS attempted_txns,
+    CAST(attempted_usd  AS decimal(18,2)) AS attempted_usd,
+    declined_rate_pct,
+    fraud_rate_pct
+  FROM dbo.v_weekly_kpi_channel
+),
+metrics AS (
+  -- Turn wide columns into rows (KPI name/value) so we can join to rules
+  SELECT week_start, channel, 'fraud_rate_pct'    AS kpi_name, CAST(fraud_rate_pct    AS decimal(10,2)) AS actual_value FROM kpi_long
+  UNION ALL
+  SELECT week_start, channel, 'declined_rate_pct' AS kpi_name, CAST(declined_rate_pct AS decimal(10,2)) AS actual_value FROM kpi_long
+),
+rules AS (
+  SELECT *
+  FROM dbo.kpi_sla_rules
+  WHERE is_active = 1
+),
+matched AS (
+  -- Prefer CHANNEL-specific rules if they exist; otherwise use GLOBAL rule
+  SELECT
+    m.week_start,
+    m.channel,
+    m.kpi_name,
+    m.actual_value,
+
+    r.owner_team,
+    r.target_value,
+    r.comparator,
+    r.severity,
+    r.scope,
+
+    ROW_NUMBER() OVER (
+      PARTITION BY m.week_start, m.channel, m.kpi_name
+      ORDER BY CASE WHEN r.scope = 'CHANNEL' THEN 1 ELSE 2 END
+    ) AS rn
+  FROM metrics m
+  JOIN rules r
+    ON r.kpi_name = m.kpi_name
+   AND (
+        r.scope = 'GLOBAL'
+        OR (r.scope = 'CHANNEL' AND r.channel = m.channel)
+       )
+)
+SELECT
+  week_start,
+  channel,
+  kpi_name,
+  actual_value,
+  comparator,
+  target_value,
+  owner_team,
+  severity,
+
+  CASE
+    WHEN comparator = '<=' AND actual_value <= target_value THEN 'PASS'
+    WHEN comparator = '>=' AND actual_value >= target_value THEN 'PASS'
+    ELSE 'FAIL'
+  END AS sla_status,
+
+  -- breach amount (positive means breach magnitude)
+  CASE
+    WHEN comparator = '<=' THEN CAST(actual_value - target_value AS decimal(10,2))
+    WHEN comparator = '>=' THEN CAST(target_value - actual_value AS decimal(10,2))
+  END AS breach_amount
+
+FROM matched
+WHERE rn = 1
+ORDER BY week_start DESC, channel, kpi_name;
+
+
+WITH scoreboard AS (
+  -- paste the scoreboard SELECT here, OR (better) create it as a view later
+  SELECT
+    week_start, channel, kpi_name, actual_value, comparator, target_value, owner_team, severity,
+    CASE
+      WHEN comparator = '<=' AND actual_value <= target_value THEN 'PASS'
+      WHEN comparator = '>=' AND actual_value >= target_value THEN 'PASS'
+      ELSE 'FAIL'
+    END AS sla_status
+  FROM (
+    SELECT *
+    FROM (
+      SELECT
+        m.week_start, m.channel, m.kpi_name, m.actual_value,
+        r.owner_team, r.target_value, r.comparator, r.severity, r.scope,
+        ROW_NUMBER() OVER (PARTITION BY m.week_start, m.channel, m.kpi_name
+          ORDER BY CASE WHEN r.scope = 'CHANNEL' THEN 1 ELSE 2 END) AS rn
+      FROM (
+        SELECT week_start, channel, 'fraud_rate_pct' AS kpi_name, CAST(fraud_rate_pct AS decimal(10,2)) actual_value
+        FROM dbo.v_weekly_kpi_channel
+        UNION ALL
+        SELECT week_start, channel, 'declined_rate_pct', CAST(declined_rate_pct AS decimal(10,2))
+        FROM dbo.v_weekly_kpi_channel
+      ) m
+      JOIN dbo.kpi_sla_rules r
+        ON r.is_active = 1
+       AND r.kpi_name = m.kpi_name
+       AND (r.scope = 'GLOBAL' OR (r.scope = 'CHANNEL' AND r.channel = m.channel))
+    ) x
+    WHERE rn = 1
+  ) y
+)
+SELECT
+  kpi_name,
+  owner_team,
+  severity,
+  COUNT(*) AS total_rows,
+  SUM(CASE WHEN sla_status = 'FAIL' THEN 1 ELSE 0 END) AS breaches,
+  CAST(100.0 * SUM(CASE WHEN sla_status = 'FAIL' THEN 1 ELSE 0 END) / NULLIF(COUNT(*),0) AS decimal(10,2)) AS breach_rate_pct
+FROM scoreboard
+GROUP BY kpi_name, owner_team, severity
+ORDER BY breaches DESC, breach_rate_pct DESC;
